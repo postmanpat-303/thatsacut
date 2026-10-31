@@ -80,8 +80,8 @@ jobs:
         shell: pwsh
         run: |
           cargo install cargo-wix --locked
-          curl -sL -o wix.zip https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
-          Expand-Archive wix.zip wix314
+          curl -sL -o "$env:RUNNER_TEMP\wix.zip" https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+          Expand-Archive "$env:RUNNER_TEMP\wix.zip" wix314
           cargo wix --bin-path wix314
           Copy-Item target/wix/*.msi .
 
