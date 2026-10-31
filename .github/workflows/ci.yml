@@ -19,6 +19,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install GUI build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

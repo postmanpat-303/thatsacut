@@ -19,7 +19,7 @@ cuts are near-instant and quality loss is zero.
 
 ## Install
 
-Requires [Rust](https://rustup.rs/) 1.74+ and FFmpeg on your `PATH`
+Requires [Rust](https://rustup.rs/) 1.76+ and FFmpeg on your `PATH`
 (or set `FFMPEG_BIN` to the ffmpeg binary).
 
 ```bash
@@ -27,6 +27,22 @@ git clone https://github.com/postmanpat-303/thatsacut.git
 cd thatsacut
 cargo install --path .
 ```
+
+This installs two binaries: `vc` (CLI) and `vc-gui` (graphical app).
+
+## GUI
+
+`vc-gui` is a native desktop app covering everything the CLI does — open a
+video, pick **Trim**, **Keep ranges** or **Cut ranges out**, edit the ranges
+with live validation and a visual timeline (green = kept), tune the
+re-encode/CRF/preset/parallelism options, grab preview frames, and run.
+
+```bash
+vc-gui
+```
+
+On Linux it needs the usual X11 dev libraries to build
+(`libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev`).
 
 ## Usage
 

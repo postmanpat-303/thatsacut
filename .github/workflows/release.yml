@@ -27,18 +27,22 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bin_name: vc.exe
+            gui_bin_name: vc-gui.exe
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             bin_name: vc
+            gui_bin_name: vc-gui
           - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
             bin_name: vc
+            gui_bin_name: vc-gui
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin_name: vc
+            gui_bin_name: vc-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +50,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install GUI build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -56,6 +66,7 @@ jobs:
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
+          cp target/${{ matrix.target }}/release/${{ matrix.gui_bin_name }} dist/
           cp README.md dist/
           tar -czf ${{ env.BIN }}-${{ matrix.name }}.tar.gz -C dist .
       - name: Package archive (windows)
@@ -64,6 +75,7 @@ jobs:
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
+          cp target/${{ matrix.target }}/release/${{ matrix.gui_bin_name }} dist/
           cp README.md dist/
           Compress-Archive -Path dist/* -DestinationPath ${{ env.BIN }}-${{ matrix.name }}.zip
 

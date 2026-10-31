@@ -73,6 +73,14 @@
                                 Source='$(var.CargoTargetBinDir)\vc.exe'
                                 KeyPath='yes'/>
                         </Component>
+                        <Component Id='binary1' Guid='*'>
+                            <File
+                                Id='exe1'
+                                Name='vc-gui.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\vc-gui.exe'
+                                KeyPath='yes'/>
+                        </Component>
                     </Directory>
                 </Directory>
             </Directory>
@@ -84,6 +92,11 @@
 
         <DirectoryRef Id='ApplicationProgramsFolder'>
             <Component Id='ApplicationShortcuts' Guid='8B2E4C10-3F5A-4D2E-9C1B-6A7E8D0F2B31'>
+                <Shortcut Id='StartMenuGuiShortcut'
+                    Name='thatsacut'
+                    Description='thatsacut video trimmer (GUI)'
+                    Target='[Bin]vc-gui.exe'
+                    WorkingDirectory='Bin'/>
                 <Shortcut Id='StartMenuShortcut'
                     Name='thatsacut command line'
                     Description='Open a command prompt with vc available'
@@ -92,9 +105,8 @@
                     WorkingDirectory='Bin'/>
                 <Shortcut Id='DesktopShortcut'
                     Name='thatsacut'
-                    Description='thatsacut command line'
-                    Target='[System64Folder]cmd.exe'
-                    Arguments='/K &quot;[Bin]vc.exe&quot; --help'
+                    Description='thatsacut video trimmer (GUI)'
+                    Target='[Bin]vc-gui.exe'
                     WorkingDirectory='Bin'
                     Directory='DesktopFolder'/>
                 <RegistryValue Root='HKCU' Key='Software\postmanpat\thatsacut' Name='shortcuts' Type='integer' Value='1' KeyPath='yes'/>
@@ -113,6 +125,7 @@
             Absent='disallow'>
             <ComponentRef Id='License'/>
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='binary1'/>
             <ComponentRef Id='ApplicationShortcuts'/>
 
             <Feature

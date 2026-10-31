@@ -1,11 +1,11 @@
-; Inno Setup script for thatsacut (vc CLI)
+; Inno Setup script for thatsacut (vc CLI + vc-gui)
 ; Built in CI by .github/workflows/release.yml
 
 #define AppName "thatsacut"
-#define AppVersion "0.1.1"
+#define AppVersion "0.2.0"
 #define AppPublisher "postmanpat"
 #define AppURL "https://github.com/postmanpat-303/thatsacut"
-#define AppExeName "vc.exe"
+#define AppExeName "vc-gui.exe"
 
 [Setup]
 AppId={{3F8C2A71-6B4D-4E9A-A1C5-7D2E8F0B3C46}
@@ -34,11 +34,13 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "..\..\target\x86_64-pc-windows-msvc\release\vc.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\target\x86_64-pc-windows-msvc\release\vc-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
+Name: "{group}\{#AppName}"; Filename: "{app}\vc-gui.exe"; WorkingDir: "{app}"
 Name: "{group}\{#AppName} command line"; Filename: "{cmd}"; Parameters: "/K ""{app}\vc.exe"" --help"; WorkingDir: "{app}"
-Name: "{userdesktop}\{#AppName}"; Filename: "{cmd}"; Parameters: "/K ""{app}\vc.exe"" --help"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\vc-gui.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 
 [Registry]
