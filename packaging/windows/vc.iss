@@ -2,7 +2,7 @@
 ; Built in CI by .github/workflows/release.yml
 
 #define AppName "thatsacut"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppPublisher "postmanpat"
 #define AppURL "https://github.com/postmanpat-303/thatsacut"
 #define AppExeName "vc.exe"
