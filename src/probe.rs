@@ -64,8 +64,12 @@ pub fn probe(ffprobe: &Path, input: &Path) -> Result<ProbeInfo> {
         serde_json::from_slice(&output.stdout).context("could not parse ffprobe JSON output")?;
 
     let streams = raw.streams.unwrap_or_default();
-    let video = streams.iter().find(|s| s.codec_type.as_deref() == Some("video"));
-    let audio = streams.iter().find(|s| s.codec_type.as_deref() == Some("audio"));
+    let video = streams
+        .iter()
+        .find(|s| s.codec_type.as_deref() == Some("video"));
+    let audio = streams
+        .iter()
+        .find(|s| s.codec_type.as_deref() == Some("audio"));
     let format = raw.format.unwrap_or(RawFormat {
         duration: None,
         size: None,

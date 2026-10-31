@@ -34,7 +34,10 @@ impl fmt::Display for PlanError {
             PlanError::EmptyVideo => write!(f, "the video has zero (or unknown) duration"),
             PlanError::EmptyPlan => write!(f, "the cut plan is empty — nothing would be kept"),
             PlanError::InvalidRange { start, end } => {
-                write!(f, "invalid range {start}–{end}: end must be greater than start")
+                write!(
+                    f,
+                    "invalid range {start}–{end}: end must be greater than start"
+                )
             }
         }
     }
@@ -98,7 +101,11 @@ pub fn build_plan(duration: f64, ranges: &[Range], remove: bool) -> Result<Vec<R
         return Err(PlanError::EmptyPlan);
     }
 
-    clamped.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    clamped.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Merge overlapping / touching ranges.
     let mut merged: Vec<Range> = Vec::with_capacity(clamped.len());
@@ -147,9 +154,27 @@ mod tests {
     #[test]
     fn parses_range_lists() {
         let rs = parse_ranges("0-10, 01:00-02:00, 1m30s-2m").unwrap();
-        assert_eq!(rs[0], Range { start: 0.0, end: 10.0 });
-        assert_eq!(rs[1], Range { start: 60.0, end: 120.0 });
-        assert_eq!(rs[2], Range { start: 90.0, end: 120.0 });
+        assert_eq!(
+            rs[0],
+            Range {
+                start: 0.0,
+                end: 10.0
+            }
+        );
+        assert_eq!(
+            rs[1],
+            Range {
+                start: 60.0,
+                end: 120.0
+            }
+        );
+        assert_eq!(
+            rs[2],
+            Range {
+                start: 90.0,
+                end: 120.0
+            }
+        );
         assert!(parse_ranges("10-5").is_err());
         assert!(parse_ranges("nope").is_err());
     }
@@ -160,7 +185,16 @@ mod tests {
         let plan = build_plan(100.0, &rs, false).unwrap();
         assert_eq!(
             plan,
-            vec![Range { start: 0.0, end: 15.0 }, Range { start: 30.0, end: 40.0 }]
+            vec![
+                Range {
+                    start: 0.0,
+                    end: 15.0
+                },
+                Range {
+                    start: 30.0,
+                    end: 40.0
+                }
+            ]
         );
     }
 
@@ -171,9 +205,18 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                Range { start: 0.0, end: 10.0 },
-                Range { start: 20.0, end: 50.0 },
-                Range { start: 60.0, end: 100.0 },
+                Range {
+                    start: 0.0,
+                    end: 10.0
+                },
+                Range {
+                    start: 20.0,
+                    end: 50.0
+                },
+                Range {
+                    start: 60.0,
+                    end: 100.0
+                },
             ]
         );
     }
@@ -182,7 +225,13 @@ mod tests {
     fn clamps_to_duration() {
         let rs = parse_ranges("0-500").unwrap();
         let plan = build_plan(100.0, &rs, false).unwrap();
-        assert_eq!(plan, vec![Range { start: 0.0, end: 100.0 }]);
+        assert_eq!(
+            plan,
+            vec![Range {
+                start: 0.0,
+                end: 100.0
+            }]
+        );
     }
 
     #[test]

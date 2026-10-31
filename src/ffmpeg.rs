@@ -33,7 +33,10 @@ impl Ffmpeg {
     pub fn locate() -> Result<Self> {
         if let Ok(custom) = std::env::var("FFMPEG_BIN") {
             let bin = PathBuf::from(&custom);
-            anyhow::ensure!(bin.exists(), "FFMPEG_BIN points to a missing file: {custom}");
+            anyhow::ensure!(
+                bin.exists(),
+                "FFMPEG_BIN points to a missing file: {custom}"
+            );
             let probe_bin = Self::probe_for(&bin);
             return Ok(Self { bin, probe_bin });
         }
@@ -67,7 +70,7 @@ impl Ffmpeg {
         if sibling.exists() {
             sibling
         } else {
-            which("ffprobe").unwrap_or_else(|_| sibling)
+            which("ffprobe").unwrap_or(sibling)
         }
     }
 
@@ -142,10 +145,7 @@ impl Ffmpeg {
         opts: &CutOptions,
         jobs: usize,
     ) -> Result<()> {
-        let ext = output
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mp4");
+        let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
         let tmp = tempfile::tempdir().context("could not create temp directory")?;
 
         // Intermediate segments are MPEG-TS regardless of the output format:
@@ -192,7 +192,10 @@ impl Ffmpeg {
         let list_path = tmp.path().join("concat.txt");
         let mut list = String::new();
         for p in &paths {
-            let escaped = p.to_string_lossy().replace('\\', "/").replace('\'', "'\\''");
+            let escaped = p
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace('\'', "'\\''");
             let _ = writeln!(list, "file '{escaped}'");
         }
         fs::write(&list_path, list)?;

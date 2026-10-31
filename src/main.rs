@@ -139,7 +139,11 @@ fn default_jobs(jobs: Option<usize>) -> usize {
 }
 
 fn print_plan(segments: &[Range]) {
-    println!("plan ({} segment{}):", segments.len(), if segments.len() == 1 { "" } else { "s" });
+    println!(
+        "plan ({} segment{}):",
+        segments.len(),
+        if segments.len() == 1 { "" } else { "s" }
+    );
     let mut total = 0.0;
     for (i, s) in segments.iter().enumerate() {
         println!(
@@ -154,6 +158,7 @@ fn print_plan(segments: &[Range]) {
     println!("  total kept: {} ({:.2}s)", time::format_time(total), total);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_multi(
     ff: &Ffmpeg,
     input: &Path,
