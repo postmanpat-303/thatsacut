@@ -3,6 +3,7 @@ name = "thatsacut"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
+authors = ["postmanpat"]
 description = "Blazing fast lossless video trimming and multi-cut tool — Rust rewrite of Pastor Video Trimmer"
 license = "MIT"
 repository = "https://github.com/postmanpat-303/thatsacut"
@@ -25,3 +26,15 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Metadata for the .deb package built by cargo-deb in CI
+[package.metadata.deb]
+maintainer = "postmanpat"
+section = "video"
+priority = "optional"
+depends = "$auto, ffmpeg"
+extended-description = """
+Blazing fast lossless video trimming and multi-cut tool.
+Provides the `vc` command: single trims, multi-range keep/cut,
+parallel segment extraction, and optional frame-accurate re-encode.
+FFmpeg is required at runtime."""
