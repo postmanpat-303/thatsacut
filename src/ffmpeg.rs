@@ -148,8 +148,11 @@ impl Ffmpeg {
             .unwrap_or("mp4");
         let tmp = tempfile::tempdir().context("could not create temp directory")?;
 
+        // Intermediate segments are MPEG-TS regardless of the output format:
+        // TS has no edit lists or global timestamps, which lets the concat
+        // demuxer build a clean, gapless timeline on stream copy.
         let paths: Vec<PathBuf> = (0..segments.len())
-            .map(|i| tmp.path().join(format!("seg_{i:04}.{ext}")))
+            .map(|i| tmp.path().join(format!("seg_{i:04}.ts")))
             .collect();
 
         // Extract segments in parallel, `jobs` at a time.
