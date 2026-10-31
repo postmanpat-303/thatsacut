@@ -1,18 +1,19 @@
-//! `vc-gui` — graphical frontend for thatsacut.
+//! `vc-gui` — friendly graphical frontend for thatsacut.
 //!
-//! A native egui app exposing everything the `vc` CLI can do:
-//! probing, single trims, multi-range keep/cut, frame grabs and the
-//! re-encode options — with a visual timeline of the cut plan.
+//! Drag a video in, scrub the filmstrip, drag the handles to pick what to
+//! keep (or remove), hit Export. Everything the `vc` CLI can do — trims,
+//! multi-range keep/cut, frame grabs, re-encode options — no timestamps
+//! required.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, RichText};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use thatsacut::ffmpeg::{CutOptions, Ffmpeg};
 use thatsacut::plan::{self, Range};
 use thatsacut::probe::{self, ProbeInfo};
-use thatsacut::time;
 
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "avi", "webm", "m4v", "ts", "mpg", "mpeg", "wmv", "flv",
@@ -28,6 +29,10 @@ const PRESETS: &[&str] = &[
     "slower",
     "veryslow",
 ];
+const THUMBS: usize = 10;
+const STRIP_H: f32 = 64.0;
+const BAR_H: f32 = 10.0;
+const HANDLE_W: f32 = 7.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -46,14 +51,15 @@ impl Mode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct RangeRow {
-    start: String,
-    end: String,
+    start: f64,
+    end: f64,
 }
 
-/// Messages sent from the worker thread back to the UI.
+/// Messages sent from worker threads back to the UI.
 enum Msg {
+    Thumb(usize, egui::ColorImage),
     Done(Result<PathBuf, String>),
 }
 
@@ -64,6 +70,7 @@ struct GuiApp {
     input: Option<PathBuf>,
     info: Option<ProbeInfo>,
     probe_error: Option<String>,
+    thumbs: Vec<Option<egui::TextureHandle>>,
 
     mode: Mode,
     ranges: Vec<RangeRow>,
@@ -74,7 +81,7 @@ struct GuiApp {
     preset: String,
     jobs: usize,
 
-    frame_at: String,
+    snapshot_at: f64,
 
     log: Vec<String>,
     busy: bool,
@@ -88,17 +95,15 @@ impl GuiApp {
             Ok(ff) => (Some(ff), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        Self {
+        let mut app = Self {
             ff,
             ff_error,
             input: None,
             info: None,
             probe_error: None,
+            thumbs: vec![None; THUMBS],
             mode: Mode::Trim,
-            ranges: vec![RangeRow {
-                start: "0".into(),
-                end: "10".into(),
-            }],
+            ranges: vec![],
             output: String::new(),
             reencode: false,
             crf: 18,
@@ -106,12 +111,20 @@ impl GuiApp {
             jobs: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
-            frame_at: "0".into(),
+            snapshot_at: 0.0,
             log: Vec::new(),
             busy: false,
             rx: None,
             last_output: None,
+        };
+        // `vc-gui some/video.mp4` opens it straight away.
+        if let Some(arg) = std::env::args_os().nth(1) {
+            let p = PathBuf::from(arg);
+            if p.is_file() {
+                app.set_input(p);
+            }
         }
+        app
     }
 
     fn log(&mut self, s: impl Into<String>) {
@@ -128,23 +141,42 @@ impl GuiApp {
         }
     }
 
+    fn duration(&self) -> f64 {
+        self.info.as_ref().map(|i| i.duration).unwrap_or(0.0)
+    }
+
+    fn reset_ranges(&mut self) {
+        let d = self.duration();
+        self.ranges = match self.mode {
+            Mode::Trim | Mode::Keep => vec![RangeRow { start: 0.0, end: d }],
+            Mode::Cut => vec![RangeRow {
+                start: d * 0.25,
+                end: d * 0.5,
+            }],
+        };
+    }
+
     fn set_input(&mut self, path: PathBuf) {
         self.info = None;
         self.probe_error = None;
         self.last_output = None;
+        self.thumbs = vec![None; THUMBS];
+        let mut duration = 0.0;
         if let Some(ff) = &self.ff {
             match probe::probe(&ff.probe_bin, &path) {
                 Ok(info) => {
+                    duration = info.duration;
                     self.log(format!(
-                        "probed {} — {} ({:.3}s)",
+                        "opened {} — {} long",
                         path.display(),
-                        time::format_time(info.duration),
-                        info.duration
+                        fmt_secs(info.duration)
                     ));
                     self.info = Some(info);
                 }
                 Err(e) => {
-                    self.probe_error = Some(format!("{e:#}"));
+                    self.probe_error = Some(format!(
+                        "That file doesn't look like a readable video ({e:#})"
+                    ));
                 }
             }
         }
@@ -152,36 +184,98 @@ impl GuiApp {
             .to_string_lossy()
             .into_owned();
         self.input = Some(path);
+        self.reset_ranges();
+        self.spawn_thumbs(duration);
     }
 
-    /// Parse the range rows into concrete ranges, mirroring the CLI rules.
-    fn parse_rows(&self) -> Result<Vec<Range>, String> {
-        let mut out = Vec::new();
-        for (i, row) in self.ranges.iter().enumerate() {
-            let start = time::parse_time(row.start.trim())
-                .map_err(|e| format!("range {} start: {e:#}", i + 1))?;
-            let end = time::parse_time(row.end.trim())
-                .map_err(|e| format!("range {} end: {e:#}", i + 1))?;
-            if end <= start {
-                return Err(format!("range {}: end must be later than start", i + 1));
-            }
-            out.push(Range { start, end });
+    /// Grab filmstrip thumbnails in the background via ffmpeg.
+    fn spawn_thumbs(&mut self, duration: f64) {
+        if duration <= 0.0 {
+            return;
         }
-        Ok(out)
+        let (Some(ff), Some(input)) = (self.ff.clone(), self.input.clone()) else {
+            return;
+        };
+        let (tx, rx) = channel();
+        // Merge with the shared receiver if a job is running; normally not.
+        if self.rx.is_none() {
+            self.rx = Some(rx);
+        } else {
+            // A cut is running — thumbnails are cosmetic, skip them.
+            return;
+        }
+        std::thread::spawn(move || {
+            let Ok(tmp) = tempfile::tempdir() else { return };
+            for i in 0..THUMBS {
+                let t = duration * (i as f64 + 0.5) / THUMBS as f64;
+                let out = tmp.path().join(format!("t{i}.jpg"));
+                let ok = Command::new(&ff.bin)
+                    .args([
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-ss",
+                        &format!("{t:.3}"),
+                        "-i",
+                        &input.to_string_lossy(),
+                        "-vframes",
+                        "1",
+                        "-vf",
+                        "scale=320:-2",
+                    ])
+                    .arg(&out)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&out) else {
+                    continue;
+                };
+                let Ok(img) = image::load_from_memory(&bytes) else {
+                    continue;
+                };
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let _ = tx.send(Msg::Thumb(
+                    i,
+                    egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+                ));
+            }
+        });
     }
 
-    /// Build the final kept-segment plan for the current mode.
+    /// Final kept-segment plan for the current mode.
     fn build_plan(&self) -> Result<Vec<Range>, String> {
-        let duration = self
-            .info
-            .as_ref()
-            .map(|i| i.duration)
-            .ok_or("load a video first")?;
-        let rows = self.parse_rows()?;
+        if self.info.is_none() {
+            return Err("Open a video first.".into());
+        }
+        for (i, r) in self.ranges.iter().enumerate() {
+            if r.end <= r.start {
+                return Err(format!(
+                    "Part {} ends before it starts — drag the handles apart.",
+                    i + 1
+                ));
+            }
+        }
+        let rows: Vec<Range> = self
+            .ranges
+            .iter()
+            .map(|r| Range {
+                start: r.start,
+                end: r.end.min(self.duration()),
+            })
+            .collect();
         match self.mode {
             Mode::Trim => Ok(vec![rows[0]]),
-            Mode::Keep => plan::build_plan(duration, &rows, false).map_err(|e| format!("{e:#}")),
-            Mode::Cut => plan::build_plan(duration, &rows, true).map_err(|e| format!("{e:#}")),
+            Mode::Keep => {
+                plan::build_plan(self.duration(), &rows, false).map_err(|e| format!("{e:#}"))
+            }
+            Mode::Cut => {
+                plan::build_plan(self.duration(), &rows, true).map_err(|e| format!("{e:#}"))
+            }
         }
     }
 
@@ -194,7 +288,7 @@ impl GuiApp {
             return;
         };
         let Some(input) = self.input.clone() else {
-            self.log("error: choose a video first");
+            self.log("error: open a video first");
             return;
         };
         let segments = match self.build_plan() {
@@ -205,7 +299,7 @@ impl GuiApp {
             }
         };
         if segments.is_empty() {
-            self.log("error: cut plan is empty — nothing to keep");
+            self.log("error: nothing would be left — widen the green parts");
             return;
         }
         let mut output = PathBuf::from(self.output.trim());
@@ -221,19 +315,16 @@ impl GuiApp {
         let jobs = self.jobs;
 
         self.log(format!(
-            "plan: {} segment(s), {:.2}s kept → {}",
-            segments.len(),
-            segments.iter().map(Range::duration).sum::<f64>(),
+            "exporting {} of video → {}",
+            fmt_secs(segments.iter().map(Range::duration).sum()),
             output.display()
         ));
-        self.log(if opts.reencode {
-            format!(
-                "re-encoding (libx264 crf={} preset={}) — this may take a while…",
+        if opts.reencode {
+            self.log(format!(
+                "re-encoding (crf={} preset={}) — this can take a while…",
                 opts.crf, opts.preset
-            )
-        } else {
-            "stream copy (lossless, keyframe snapped)…".to_string()
-        });
+            ));
+        }
 
         let (tx, rx) = channel();
         self.rx = Some(rx);
@@ -252,16 +343,10 @@ impl GuiApp {
         }
         let Some(ff) = self.ff.clone() else { return };
         let Some(input) = self.input.clone() else {
-            self.log("error: choose a video first");
+            self.log("error: open a video first");
             return;
         };
-        let t = match time::parse_time(self.frame_at.trim()) {
-            Ok(t) => t,
-            Err(e) => {
-                self.log(format!("error: frame time: {e:#}"));
-                return;
-            }
-        };
+        let t = self.snapshot_at.min(self.duration());
         let stem = input
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -279,6 +364,7 @@ impl GuiApp {
 
     fn drain_worker(&mut self, ctx: &egui::Context) {
         let mut pending = Vec::new();
+        let mut channel_closed = false;
         if let Some(rx) = &self.rx {
             while let Ok(msg) = rx.try_recv() {
                 pending.push(msg);
@@ -286,21 +372,498 @@ impl GuiApp {
         }
         for msg in pending {
             match msg {
+                Msg::Thumb(i, img) => {
+                    if i < self.thumbs.len() {
+                        self.thumbs[i] = Some(ctx.load_texture(
+                            format!("thumb{i}"),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
                 Msg::Done(Ok(path)) => {
-                    self.log(format!("✔ wrote {}", path.display()));
+                    self.log(format!("✔ saved {}", path.display()));
                     self.last_output = Some(path);
                     self.busy = false;
-                    self.rx = None;
+                    channel_closed = true;
                 }
                 Msg::Done(Err(e)) => {
                     self.log(format!("✖ failed: {e}"));
                     self.busy = false;
-                    self.rx = None;
+                    channel_closed = true;
                 }
             }
         }
-        if self.busy {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if channel_closed {
+            self.rx = None;
+        }
+        // Keep repainting while thumbnails stream in or a job runs.
+        let waiting_thumbs = self.info.is_some() && self.thumbs.iter().any(|t| t.is_none());
+        if self.busy || waiting_thumbs {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+    }
+
+    // ---------- UI pieces ----------
+
+    fn ui_drop_zone(&mut self, ui: &mut egui::Ui) {
+        let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let frame = egui::Frame::group(ui.style()).fill(if hovering {
+            Color32::from_rgb(40, 70, 50)
+        } else {
+            ui.visuals().extreme_bg_color
+        });
+        frame.show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(24.0);
+                ui.label(RichText::new("🎬 Drop a video here").size(22.0).strong());
+                ui.add_space(4.0);
+                ui.label(RichText::new("or").weak());
+                ui.add_space(4.0);
+                if ui
+                    .button(RichText::new("Choose a video…").size(16.0))
+                    .clicked()
+                {
+                    self.open_video();
+                }
+                ui.add_space(24.0);
+            });
+        });
+    }
+
+    fn ui_video_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("📂 Change video").clicked() {
+                self.open_video();
+            }
+            if let Some(p) = &self.input {
+                ui.label(
+                    RichText::new(p.file_name().unwrap_or_default().to_string_lossy()).strong(),
+                );
+            }
+        });
+        if let Some(info) = &self.info {
+            let mut chips = vec![format!("⏱ {}", fmt_secs(info.duration))];
+            if let (Some(w), Some(h)) = (info.width, info.height) {
+                chips.push(format!("🖼 {w}×{h}"));
+            }
+            if let Some(c) = &info.video_codec {
+                chips.push(c.clone());
+            }
+            if let Some(s) = info.size_bytes {
+                chips.push(format!("{:.0} MB", s as f64 / (1024.0 * 1024.0)));
+            }
+            ui.label(RichText::new(chips.join("   ·   ")).small().weak());
+        }
+        if let Some(e) = &self.probe_error {
+            ui.label(RichText::new(e).color(Color32::from_rgb(230, 120, 120)));
+        }
+    }
+
+    fn ui_mode(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("What do you want to do?").strong());
+        ui.horizontal(|ui| {
+            let old = self.mode;
+            for (mode, title, hint) in [
+                (
+                    Mode::Trim,
+                    "✂️  Trim to one clip",
+                    "keep one part of the video",
+                ),
+                (
+                    Mode::Keep,
+                    "⭐  Keep these parts",
+                    "join the good bits together",
+                ),
+                (Mode::Cut, "🗑  Remove these parts", "cut out ads, mistakes…"),
+            ] {
+                let selected = self.mode == mode;
+                let text = if selected {
+                    RichText::new(title).strong()
+                } else {
+                    RichText::new(title)
+                };
+                if ui.selectable_label(selected, text).clicked() {
+                    self.mode = mode;
+                }
+                ui.label(RichText::new(hint).small().weak());
+                ui.add_space(8.0);
+            }
+            if self.mode != old && self.info.is_some() {
+                self.reset_ranges();
+                if let Some(input) = &self.input {
+                    self.output = default_output(input, self.mode.tag())
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+        });
+    }
+
+    /// Filmstrip + kept/removed bar + draggable handles.
+    fn ui_timeline(&mut self, ui: &mut egui::Ui) {
+        let duration = self.duration();
+        if duration <= 0.0 {
+            return;
+        }
+        let plan = self.build_plan().unwrap_or_default();
+        let total_h = STRIP_H + BAR_H + HANDLE_W + 8.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), total_h),
+            egui::Sense::hover(),
+        );
+        let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), STRIP_H));
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), strip.bottom() + 2.0),
+            egui::vec2(rect.width(), BAR_H),
+        );
+        let painter = ui.painter_at(rect);
+
+        let x_of = |t: f64| rect.left() + (t / duration).clamp(0.0, 1.0) as f32 * rect.width();
+
+        // Thumbnails, centre-cropped to their cell.
+        let cell_w = rect.width() / THUMBS as f32;
+        for i in 0..THUMBS {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + i as f32 * cell_w, strip.top()),
+                egui::vec2(cell_w, STRIP_H),
+            );
+            painter.rect_filled(cell, 0.0, Color32::from_rgb(28, 28, 32));
+            if let Some(tex) = &self.thumbs[i] {
+                let img = tex.size_vec2();
+                let ir = img.x / img.y.max(1.0);
+                let cr = cell.width() / cell.height();
+                let uv = if ir > cr {
+                    let keep = cr / ir;
+                    egui::Rect::from_min_max(
+                        egui::pos2((1.0 - keep) / 2.0, 0.0),
+                        egui::pos2(1.0 - (1.0 - keep) / 2.0, 1.0),
+                    )
+                } else {
+                    let keep = ir / cr;
+                    egui::Rect::from_min_max(
+                        egui::pos2(0.0, (1.0 - keep) / 2.0),
+                        egui::pos2(1.0, 1.0 - (1.0 - keep) / 2.0),
+                    )
+                };
+                painter.image(tex.id(), cell, uv, Color32::WHITE);
+            }
+        }
+
+        // Dim cells whose midpoint is outside the kept plan.
+        if !plan.is_empty() {
+            for i in 0..THUMBS {
+                let mid = duration * (i as f64 + 0.5) / THUMBS as f64;
+                let kept = plan.iter().any(|s| mid >= s.start && mid < s.end);
+                if !kept {
+                    let cell = egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + i as f32 * cell_w, strip.top()),
+                        egui::vec2(cell_w, STRIP_H),
+                    );
+                    painter.rect_filled(cell, 0.0, Color32::from_black_alpha(170));
+                }
+            }
+        }
+        painter.rect_stroke(
+            strip,
+            0.0,
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(80, 80, 90)),
+        );
+
+        // Kept-segments bar.
+        painter.rect_filled(bar, 3.0, Color32::from_rgb(64, 34, 38));
+        for seg in &plan {
+            let seg_rect = egui::Rect::from_min_max(
+                egui::pos2(x_of(seg.start), bar.top()),
+                egui::pos2(x_of(seg.end).max(x_of(seg.start) + 2.0), bar.bottom()),
+            );
+            painter.rect_filled(seg_rect, 3.0, Color32::from_rgb(80, 185, 105));
+        }
+
+        // Draggable handles at every range boundary.
+        for i in 0..self.ranges.len() {
+            for side in 0..2 {
+                let t = if side == 0 {
+                    self.ranges[i].start
+                } else {
+                    self.ranges[i].end
+                };
+                let x = x_of(t);
+                let handle_rect = egui::Rect::from_min_max(
+                    egui::pos2(x - HANDLE_W / 2.0, strip.top()),
+                    egui::pos2(x + HANDLE_W / 2.0, bar.bottom() + HANDLE_W),
+                );
+                let id = ui.id().with(("handle", i, side));
+                let response = ui.interact(handle_rect, id, egui::Sense::drag());
+                let hovered = response.hovered() || response.dragged();
+                let color = if hovered {
+                    Color32::from_rgb(255, 210, 90)
+                } else {
+                    Color32::WHITE
+                };
+                painter.rect_filled(handle_rect, 2.0, color);
+                if hovered {
+                    let label = format!(
+                        "{} part {} — {}",
+                        if side == 0 { "start of" } else { "end of" },
+                        i + 1,
+                        fmt_secs(t)
+                    );
+                    response
+                        .clone()
+                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                        .on_hover_text(label);
+                }
+                if response.dragged() {
+                    let dx = response.drag_delta().x;
+                    let dt = dx as f64 / rect.width() as f64 * duration;
+                    let row = &mut self.ranges[i];
+                    if side == 0 {
+                        row.start = (row.start + dt).clamp(0.0, row.end - 0.05);
+                    } else {
+                        row.end = (row.end + dt).clamp(row.start + 0.05, duration);
+                    }
+                }
+            }
+        }
+
+        let kept_total: f64 = plan.iter().map(Range::duration).sum();
+        ui.label(
+            RichText::new(format!(
+                "Exporting {} of {} — drag the white handles to adjust",
+                fmt_secs(kept_total),
+                fmt_secs(duration)
+            ))
+            .small()
+            .weak(),
+        );
+    }
+
+    fn ui_ranges(&mut self, ui: &mut egui::Ui) {
+        let duration = self.duration();
+        let rows = if self.mode == Mode::Trim {
+            self.ranges.len().min(1)
+        } else {
+            self.ranges.len()
+        };
+        let mut remove_idx = None;
+        for i in 0..rows {
+            ui.horizontal(|ui| {
+                let verb = match self.mode {
+                    Mode::Trim => "Keep from",
+                    Mode::Keep => "Part",
+                    Mode::Cut => "Remove from",
+                };
+                if self.mode == Mode::Cut && i > 0 {
+                    ui.label("and from");
+                } else if self.mode == Mode::Keep {
+                    ui.label(format!("{verb} {}", i + 1));
+                } else {
+                    ui.label(verb);
+                }
+                let row = &mut self.ranges[i];
+                ui.add(
+                    egui::DragValue::new(&mut row.start)
+                        .speed(0.2)
+                        .range(0.0..=(row.end - 0.05).max(0.0))
+                        .custom_formatter(|v, _| fmt_secs(v)),
+                );
+                ui.label("to");
+                ui.add(
+                    egui::DragValue::new(&mut row.end)
+                        .speed(0.2)
+                        .range((row.start + 0.05).min(duration)..=duration)
+                        .custom_formatter(|v, _| fmt_secs(v)),
+                );
+                ui.label(
+                    RichText::new(format!("({})", fmt_secs(row.end - row.start)))
+                        .small()
+                        .weak(),
+                );
+                if self.mode != Mode::Trim && self.ranges.len() > 1 && ui.button("✕").clicked() {
+                    remove_idx = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove_idx {
+            self.ranges.remove(i);
+        }
+        if self.mode != Mode::Trim && ui.button("+ Add another part").clicked() {
+            let d = self.duration();
+            self.ranges.push(RangeRow {
+                start: (d * 0.5).min(d),
+                end: d,
+            });
+        }
+    }
+
+    fn ui_export(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Save as").strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.output)
+                    .desired_width((ui.available_width() - 90.0).max(120.0)),
+            );
+            if ui.button("Browse…").clicked() {
+                let mut dlg = rfd::FileDialog::new()
+                    .add_filter("Video files", VIDEO_EXTS)
+                    .add_filter("All files", &["*"]);
+                if !self.output.is_empty() {
+                    let p = PathBuf::from(&self.output);
+                    if let Some(dir) = p.parent() {
+                        dlg = dlg.set_directory(dir);
+                    }
+                    if let Some(name) = p.file_name() {
+                        dlg = dlg.set_file_name(name.to_string_lossy());
+                    }
+                }
+                if let Some(path) = dlg.save_file() {
+                    self.output = path.to_string_lossy().into_owned();
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        let valid = self.build_plan().map(|p| !p.is_empty()).unwrap_or(false);
+        ui.horizontal(|ui| {
+            let button = ui.add_enabled(
+                valid,
+                egui::Button::new(RichText::new("🚀  Export video").size(17.0).strong())
+                    .min_size(egui::vec2(170.0, 38.0)),
+            );
+            if button.clicked() {
+                self.start_job();
+            }
+            if let Err(e) = self.build_plan() {
+                ui.label(
+                    RichText::new(e)
+                        .color(Color32::from_rgb(230, 160, 60))
+                        .small(),
+                );
+            } else if !self.reencode {
+                ui.label(
+                    RichText::new(
+                        "Tip: lossless mode snaps to the nearest keyframe — \
+                         turn on re-encoding in Advanced for frame-exact cuts.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        });
+    }
+
+    fn ui_success(&mut self, ui: &mut egui::Ui) {
+        let Some(out) = self.last_output.clone() else {
+            return;
+        };
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(30, 55, 38))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("✔ Done!")
+                            .strong()
+                            .color(Color32::from_rgb(130, 220, 150)),
+                    );
+                    ui.label(out.display().to_string());
+                    if ui.button("Show in folder").clicked() {
+                        reveal_in_folder(&out);
+                    }
+                    if ui.button("▶ Play").clicked() {
+                        open_file(&out);
+                    }
+                });
+            });
+    }
+
+    fn ui_advanced(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(RichText::new("⚙ Advanced options").small())
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.reencode, "Re-encode (frame-accurate, slower)");
+                    ui.add_enabled_ui(self.reencode, |ui| {
+                        ui.label("Quality (CRF)");
+                        ui.add(egui::Slider::new(&mut self.crf, 0..=51));
+                        ui.label("Speed preset");
+                        egui::ComboBox::from_id_salt("preset")
+                            .selected_text(&self.preset)
+                            .show_ui(ui, |ui| {
+                                for p in PRESETS {
+                                    ui.selectable_value(&mut self.preset, (*p).to_string(), *p);
+                                }
+                            });
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!self.reencode, |ui| {
+                        ui.label("Parallel jobs (lossless multi-cut)");
+                        ui.add(egui::Slider::new(&mut self.jobs, 1..=16));
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("📷 Save a snapshot at");
+                    let duration = self.duration();
+                    ui.add(
+                        egui::DragValue::new(&mut self.snapshot_at)
+                            .speed(0.2)
+                            .range(0.0..=duration)
+                            .custom_formatter(|v, _| fmt_secs(v)),
+                    );
+                    if ui.button("Save JPEG").clicked() {
+                        self.grab_frame();
+                    }
+                });
+                match &self.ff {
+                    Some(ff) => {
+                        ui.label(
+                            RichText::new(format!("ffmpeg: {}", ff.bin.display()))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(format!(
+                                "ffmpeg not found — {}",
+                                self.ff_error.as_deref().unwrap_or("")
+                            ))
+                            .color(Color32::from_rgb(230, 120, 120))
+                            .small(),
+                        );
+                        if ui.button("Locate ffmpeg…").clicked() {
+                            self.locate_ffmpeg();
+                        }
+                    }
+                }
+            });
+    }
+
+    fn locate_ffmpeg(&mut self) {
+        if let Some(bin) = rfd::FileDialog::new()
+            .add_filter("ffmpeg", &["exe"])
+            .pick_file()
+        {
+            let sibling = bin.with_file_name(if cfg!(windows) {
+                "ffprobe.exe"
+            } else {
+                "ffprobe"
+            });
+            let probe_bin = if sibling.exists() {
+                sibling
+            } else {
+                which::which("ffprobe").unwrap_or(sibling)
+            };
+            self.ff = Some(Ffmpeg {
+                bin: bin.clone(),
+                probe_bin,
+            });
+            self.ff_error = None;
+            self.log(format!("using ffmpeg at {}", bin.display()));
+            if let Some(input) = self.input.clone() {
+                self.set_input(input);
+            }
         }
     }
 }
@@ -317,345 +880,117 @@ fn default_output(input: &Path, tag: &str) -> PathBuf {
     input.with_file_name(format!("{stem}_{tag}.{ext}"))
 }
 
+/// `1:05.0`, `0:12.5`, `1:02:03.4`
+fn fmt_secs(s: f64) -> String {
+    let s = s.max(0.0);
+    let h = (s / 3600.0) as u64;
+    let m = ((s % 3600.0) / 60.0) as u64;
+    let sec = s % 60.0;
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:04.1}")
+    } else {
+        format!("{m}:{sec:04.1}")
+    }
+}
+
+fn reveal_in_folder(path: &Path) {
+    if cfg!(target_os = "windows") {
+        let _ = Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
+    } else if cfg!(target_os = "macos") {
+        let _ = Command::new("open").arg("-R").arg(path).spawn();
+    } else if let Some(parent) = path.parent() {
+        let _ = Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+fn open_file(path: &Path) {
+    if cfg!(target_os = "windows") {
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn();
+    } else if cfg!(target_os = "macos") {
+        let _ = Command::new("open").arg(path).spawn();
+    } else {
+        let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_worker(ctx);
 
+        // Drag-and-drop a video anywhere onto the window.
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(f) = dropped.into_iter().next() {
+            if let Some(path) = f.path {
+                self.set_input(path);
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(!self.busy, |ui| {
-                ui.heading("thatsacut — video trimmer");
-                ui.add_space(6.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    ui.add_space(4.0);
 
-                // ---------- FFmpeg status ----------
-                match &self.ff {
-                    Some(ff) => {
-                        ui.label(
-                            RichText::new(format!("ffmpeg: {}", ff.bin.display()))
-                                .color(Color32::from_rgb(120, 200, 120))
-                                .small(),
-                        );
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new(format!(
-                                "ffmpeg not found — {}",
-                                self.ff_error.as_deref().unwrap_or("")
-                            ))
-                            .color(Color32::from_rgb(230, 120, 120))
-                            .small(),
-                        );
-                        if ui.button("Locate ffmpeg…").clicked() {
-                            if let Some(bin) = rfd::FileDialog::new()
-                                .add_filter("ffmpeg", &["exe"])
-                                .pick_file()
-                            {
-                                let sibling = bin.with_file_name(if cfg!(windows) {
-                                    "ffprobe.exe"
-                                } else {
-                                    "ffprobe"
+                    if self.ff.is_none() {
+                        egui::Frame::group(ui.style())
+                            .fill(Color32::from_rgb(70, 40, 40))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("⚠ FFmpeg wasn't found on this computer.");
+                                    if ui.button("Find it manually…").clicked() {
+                                        self.locate_ffmpeg();
+                                    }
                                 });
-                                let probe_bin = if sibling.exists() {
-                                    sibling
-                                } else {
-                                    which::which("ffprobe").unwrap_or(sibling)
-                                };
-                                self.ff = Some(Ffmpeg {
-                                    bin: bin.clone(),
-                                    probe_bin,
-                                });
-                                self.ff_error = None;
-                                self.log(format!("using ffmpeg at {}", bin.display()));
-                                if let Some(input) = self.input.clone() {
-                                    self.set_input(input);
-                                }
-                            }
-                        }
+                            });
+                        ui.add_space(6.0);
                     }
-                }
-                ui.add_space(4.0);
 
-                // ---------- Input ----------
-                ui.horizontal(|ui| {
-                    if ui.button("Open video…").clicked() {
-                        self.open_video();
+                    if self.input.is_none() {
+                        self.ui_drop_zone(ui);
+                    } else {
+                        self.ui_video_header(ui);
+                        ui.add_space(8.0);
+                        self.ui_mode(ui);
+                        ui.add_space(8.0);
+                        self.ui_timeline(ui);
+                        ui.add_space(4.0);
+                        self.ui_ranges(ui);
+                        ui.add_space(10.0);
+                        ui.separator();
+                        self.ui_export(ui);
                     }
-                    match &self.input {
-                        Some(p) => {
-                            ui.label(p.display().to_string());
-                        }
-                        None => {
-                            ui.label(RichText::new("no file selected").italics());
-                        }
-                    }
+                    ui.add_space(6.0);
+                    self.ui_advanced(ui);
                 });
 
-                // ---------- Probe info ----------
-                if let Some(info) = &self.info {
-                    ui.add_space(4.0);
-                    egui::Grid::new("info_grid")
-                        .num_columns(4)
-                        .spacing([16.0, 2.0])
+                if self.busy {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Working on it…");
+                    });
+                }
+                self.ui_success(ui);
+
+                if !self.log.is_empty() {
+                    ui.add_space(6.0);
+                    egui::CollapsingHeader::new(RichText::new("Activity log").small())
+                        .default_open(false)
                         .show(ui, |ui| {
-                            ui.label(RichText::new("duration").strong());
-                            ui.label(format!(
-                                "{} ({:.3}s)",
-                                time::format_time(info.duration),
-                                info.duration
-                            ));
-                            ui.label(RichText::new("resolution").strong());
-                            ui.label(match (info.width, info.height) {
-                                (Some(w), Some(h)) => format!("{w}×{h}"),
-                                _ => "—".into(),
-                            });
-                            ui.end_row();
-                            ui.label(RichText::new("video").strong());
-                            ui.label(info.video_codec.clone().unwrap_or("—".into()));
-                            ui.label(RichText::new("audio").strong());
-                            ui.label(info.audio_codec.clone().unwrap_or("—".into()));
-                            ui.end_row();
-                            ui.label(RichText::new("size").strong());
-                            ui.label(match info.size_bytes {
-                                Some(s) => format!("{:.1} MB", s as f64 / (1024.0 * 1024.0)),
-                                None => "—".into(),
-                            });
-                            ui.label(RichText::new("bitrate").strong());
-                            ui.label(match info.bit_rate {
-                                Some(b) => format!("{:.2} Mbit/s", b as f64 / 1_000_000.0),
-                                None => "—".into(),
-                            });
-                            ui.end_row();
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for line in &self.log {
+                                        ui.label(RichText::new(line).monospace().small());
+                                    }
+                                });
                         });
                 }
-                if let Some(e) = &self.probe_error {
-                    ui.label(RichText::new(format!("probe failed: {e}")).color(Color32::from_rgb(230, 120, 120)));
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ---------- Mode ----------
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Mode").strong());
-                    let old = self.mode;
-                    ui.radio_value(&mut self.mode, Mode::Trim, "Trim (single range)");
-                    ui.radio_value(&mut self.mode, Mode::Keep, "Keep ranges");
-                    ui.radio_value(&mut self.mode, Mode::Cut, "Cut ranges out");
-                    if self.mode != old {
-                        if self.mode == Mode::Trim && self.ranges.is_empty() {
-                            self.ranges.push(RangeRow {
-                                start: "0".into(),
-                                end: "10".into(),
-                            });
-                        }
-                        if let Some(input) = &self.input {
-                            self.output = default_output(input, self.mode.tag())
-                                .to_string_lossy()
-                                .into_owned();
-                        }
-                    }
-                });
-
-                // ---------- Ranges ----------
-                let row_count = if self.mode == Mode::Trim {
-                    1
-                } else {
-                    self.ranges.len()
-                };
-                let mut remove_idx = None;
-                egui::Grid::new("ranges_grid")
-                    .num_columns(4)
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("start").small());
-                        ui.label(RichText::new("end").small());
-                        ui.label("");
-                        ui.label(RichText::new("formats: 90 · 01:30 · 1m30s · 00:01:30.500").small().italics());
-                        ui.end_row();
-                        for i in 0..row_count {
-                            let row = &mut self.ranges[i];
-                            ui.add(egui::TextEdit::singleline(&mut row.start).desired_width(110.0));
-                            ui.add(egui::TextEdit::singleline(&mut row.end).desired_width(110.0));
-                            let parsed = time::parse_time(row.start.trim())
-                                .and_then(|s| time::parse_time(row.end.trim()).map(|e| (s, e)));
-                            match parsed {
-                                Ok((s, e)) if e > s => {
-                                    ui.label(RichText::new(format!(
-                                        "{:.2}s → {:.2}s ({:.2}s)",
-                                        s,
-                                        e,
-                                        e - s
-                                    ))
-                                    .small());
-                                }
-                                Ok(_) => {
-                                    ui.label(RichText::new("end ≤ start").color(Color32::from_rgb(230, 160, 60)).small());
-                                }
-                                Err(_) => {
-                                    ui.label(RichText::new("invalid time").color(Color32::from_rgb(230, 120, 120)).small());
-                                }
-                            }
-                            if self.mode != Mode::Trim
-                                && self.ranges.len() > 1
-                                && ui.button("✕").clicked()
-                            {
-                                remove_idx = Some(i);
-                            }
-                            ui.end_row();
-                        }
-                    });
-                if let Some(i) = remove_idx {
-                    self.ranges.remove(i);
-                }
-                if self.mode != Mode::Trim && ui.button("+ Add range").clicked() {
-                    self.ranges.push(RangeRow {
-                        start: "0".into(),
-                        end: "10".into(),
-                    });
-                }
-
-                // ---------- Timeline ----------
-                if let Some(info) = &self.info {
-                    let duration = info.duration.max(f64::EPSILON);
-                    match self.build_plan() {
-                        Ok(segments) if !segments.is_empty() => {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 30.0),
-                                egui::Sense::hover(),
-                            );
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(rect, 4.0, Color32::from_rgb(50, 30, 34));
-                            for seg in &segments {
-                                let x0 = rect.left() + (seg.start / duration) as f32 * rect.width();
-                                let x1 = rect.left() + (seg.end.min(duration) / duration) as f32 * rect.width();
-                                painter.rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(x0, rect.top()),
-                                        egui::pos2(x1.max(x0 + 1.5), rect.bottom()),
-                                    ),
-                                    4.0,
-                                    Color32::from_rgb(70, 160, 90),
-                                );
-                            }
-                            painter.rect_stroke(
-                                rect,
-                                4.0,
-                                egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 90, 90)),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "timeline: green = kept · {} segment(s) · {:.2}s of {:.2}s kept",
-                                    segments.len(),
-                                    segments.iter().map(Range::duration).sum::<f64>(),
-                                    duration
-                                ))
-                                .small(),
-                            );
-                        }
-                        Ok(_) => {
-                            ui.label(RichText::new("plan is empty — nothing would be kept").color(Color32::from_rgb(230, 160, 60)).small());
-                        }
-                        Err(e) => {
-                            ui.label(RichText::new(e).color(Color32::from_rgb(230, 120, 120)).small());
-                        }
-                    }
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ---------- Options ----------
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.reencode, "Re-encode (frame accurate, slower)");
-                    ui.add_enabled_ui(self.reencode, |ui| {
-                        ui.label("CRF");
-                        ui.add(egui::Slider::new(&mut self.crf, 0..=51));
-                        ui.label("Preset");
-                        egui::ComboBox::from_id_salt("preset")
-                            .selected_text(&self.preset)
-                            .show_ui(ui, |ui| {
-                                for p in PRESETS {
-                                    ui.selectable_value(&mut self.preset, (*p).to_string(), *p);
-                                }
-                            });
-                    });
-                });
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!self.reencode, |ui| {
-                        ui.label("Parallel jobs (lossless multi-cut)");
-                        ui.add(egui::Slider::new(&mut self.jobs, 1..=16));
-                    });
-                });
-
-                // ---------- Output ----------
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Output").strong());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.output)
-                            .desired_width(ui.available_width() - 180.0),
-                    );
-                    if ui.button("Browse…").clicked() {
-                        let mut dlg = rfd::FileDialog::new()
-                            .add_filter("Video files", VIDEO_EXTS)
-                            .add_filter("All files", &["*"]);
-                        if !self.output.is_empty() {
-                            let p = PathBuf::from(&self.output);
-                            if let Some(dir) = p.parent() {
-                                dlg = dlg.set_directory(dir);
-                            }
-                            if let Some(name) = p.file_name() {
-                                dlg = dlg.set_file_name(name.to_string_lossy());
-                            }
-                        }
-                        if let Some(path) = dlg.save_file() {
-                            self.output = path.to_string_lossy().into_owned();
-                        }
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let run = ui.add(
-                        egui::Button::new(RichText::new("▶ Run cut").strong())
-                            .min_size(egui::vec2(110.0, 30.0)),
-                    );
-                    if run.clicked() {
-                        self.start_job();
-                    }
-                    ui.separator();
-                    ui.label("Frame at");
-                    ui.add(egui::TextEdit::singleline(&mut self.frame_at).desired_width(90.0));
-                    if ui.button("Grab JPEG").clicked() {
-                        self.grab_frame();
-                    }
-                });
             });
-
-            if self.busy {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("working…");
-                });
-            }
-            if let Some(out) = &self.last_output {
-                ui.label(
-                    RichText::new(format!("last output: {}", out.display()))
-                        .color(Color32::from_rgb(120, 200, 120)),
-                );
-            }
-
-            // ---------- Log ----------
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label(RichText::new("Log").strong());
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.log {
-                        ui.label(RichText::new(line).monospace().small());
-                    }
-                });
         });
     }
 }
@@ -664,8 +999,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("thatsacut")
-            .with_inner_size([760.0, 640.0])
-            .with_min_inner_size([640.0, 480.0]),
+            .with_inner_size([820.0, 680.0])
+            .with_min_inner_size([660.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(
