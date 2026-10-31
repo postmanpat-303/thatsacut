@@ -14,7 +14,6 @@ AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}
-DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 OutputDir=..\..\installer
 OutputBaseFilename=vc-setup-{#AppVersion}-windows-x86_64
