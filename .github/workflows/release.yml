@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  BIN: vc
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: vc.exe
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin_name: vc
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            bin_name: vc
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: vc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ---- Portable archives (all platforms) ----
+      - name: Package archive (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
+          cp README.md dist/
+          tar -czf ${{ env.BIN }}-${{ matrix.name }}.tar.gz -C dist .
+      - name: Package archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
+          cp README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath ${{ env.BIN }}-${{ matrix.name }}.zip
+
+      # ---- Windows: Inno Setup installer ----
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install innosetup --no-progress -y
+          iscc packaging\windows\vc.iss
+
+      # ---- Windows: MSI installer ----
+      - name: Build MSI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo install cargo-wix --locked
+          curl -sL -o wix.zip https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+          Expand-Archive wix.zip wix314
+          cargo wix --bin-path wix314
+          Copy-Item target/wix/*.msi .
+
+      # ---- macOS: DMG image ----
+      - name: Build DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install create-dmg
+          create-dmg --volname "thatsacut" --overwrite \
+            ${{ env.BIN }}-${{ matrix.name }}.dmg dist/ \
+            || echo "::warning::DMG creation failed, archive still published"
+
+      # ---- Linux: .deb package ----
+      - name: Build .deb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/debian/*.deb ${{ env.BIN }}-${{ matrix.name }}.deb
+
+      # ---- Collect everything ----
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: |
+            *.tar.gz
+            *.zip
+            *.deb
+            *.dmg
+            *.msi
+            installer/*.exe
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            *.tar.gz
+            *.zip
+            *.deb
+            *.dmg
+            *.msi
+            *.exe
