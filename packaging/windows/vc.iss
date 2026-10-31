@@ -30,13 +30,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "addtopath"; Description: "Add vc to your PATH (recommended)"; GroupDescription: "Extra options:"
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Extra options:"
 
 [Files]
 Source: "..\..\target\x86_64-pc-windows-msvc\release\vc.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#AppName} command line"; Filename: "{cmd}"; Parameters: "/K vc --help"; WorkingDir: "{app}"
+Name: "{group}\{#AppName} command line"; Filename: "{cmd}"; Parameters: "/K ""{app}\vc.exe"" --help"; WorkingDir: "{app}"
+Name: "{userdesktop}\{#AppName}"; Filename: "{cmd}"; Parameters: "/K ""{app}\vc.exe"" --help"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 
 [Registry]

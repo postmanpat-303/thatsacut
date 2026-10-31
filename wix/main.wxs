@@ -76,7 +76,31 @@
                     </Directory>
                 </Directory>
             </Directory>
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='thatsacut'/>
+            </Directory>
+            <Directory Id='DesktopFolder'/>
         </Directory>
+
+        <DirectoryRef Id='ApplicationProgramsFolder'>
+            <Component Id='ApplicationShortcuts' Guid='8B2E4C10-3F5A-4D2E-9C1B-6A7E8D0F2B31'>
+                <Shortcut Id='StartMenuShortcut'
+                    Name='thatsacut command line'
+                    Description='Open a command prompt with vc available'
+                    Target='[System64Folder]cmd.exe'
+                    Arguments='/K &quot;[Bin]vc.exe&quot; --help'
+                    WorkingDirectory='Bin'/>
+                <Shortcut Id='DesktopShortcut'
+                    Name='thatsacut'
+                    Description='thatsacut command line'
+                    Target='[System64Folder]cmd.exe'
+                    Arguments='/K &quot;[Bin]vc.exe&quot; --help'
+                    WorkingDirectory='Bin'
+                    Directory='DesktopFolder'/>
+                <RegistryValue Root='HKCU' Key='Software\postmanpat\thatsacut' Name='shortcuts' Type='integer' Value='1' KeyPath='yes'/>
+                <RemoveFolder Id='RemoveApplicationProgramsFolder' On='uninstall'/>
+            </Component>
+        </DirectoryRef>
 
         <Feature
             Id='Binaries'
@@ -89,6 +113,7 @@
             Absent='disallow'>
             <ComponentRef Id='License'/>
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='ApplicationShortcuts'/>
 
             <Feature
                 Id='Environment'
